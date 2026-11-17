@@ -61,7 +61,11 @@ Scripts for generating:
 - Summary tables
 
 ---
+### 6. External Validation in the Framingham Heart Study
 
+For each cardiac or aortic feature, we selected variants that reached genome-wide significance in MGBB (P < 5 × 10⁻⁸) and matched them to Framingham Heart Study (FHS) results for the same feature by chromosome, position, and alleles.
+
+---
 ## Software Requirements
 
 ### Main Tools
