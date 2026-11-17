@@ -1,0 +1,441 @@
+python3 - <<'PY'
+import csv
+import math
+import re
+from decimal import Decimal, localcontext
+from pathlib import Path
+
+# Corrected MGBB lookup files.
+# Do NOT negate MGBB beta again.
+MGBB = Path(
+"/data/circ_ukb/AHua/project/GWAS/regenie/"
+"height/metaanalysis/filter/FHS_lookup_allele_fixed"
+)
+
+FHS = Path(
+"/data/circ_ukb/wangxuet/FHS_GWAS/step2/merged_new"
+)
+
+OUT = Path(
+"/data/circ_ukb/wangxuet/FHS_GWAS/step2/"
+"overlap_tables_allele_fixed"
+)
+
+THRESHOLDS = ("5e-8")
+SIGNIFICANCE_CUTOFF = -math.log10(0.05)
+
+
+def number(value):
+try:
+value = float(value)
+return value if math.isfinite(value) else None
+except (ValueError, TypeError):
+return None
+
+
+def variant_key(chrom, pos, a0, a1):
+chrom = re.sub(r"^chr", "", chrom, flags=re.I)
+return chrom, int(pos), tuple(sorted((a0.upper(), a1.upper())))
+
+
+def percentage(numerator, denominator):
+if denominator == 0:
+return "NA"
+return round(100.0 * numerator / denominator, 4)
+
+
+def fhs_pvalue(logp):
+value = number(logp)
+if value is None or value < 0:
+return "NA"
+with localcontext() as ctx:
+ctx.prec = 30
+return format(Decimal(10) ** (-Decimal(logp)), ".12E")
+
+
+def read_mgbb(path, threshold):
+records = {}
+
+with path.open() as handle:
+reader = csv.DictReader(handle, delimiter="\t")
+required = {
+"Normalized_ID",
+"METAL_Allele1",
+"METAL_Allele2",
+"METAL_Effect",
+"METAL_StdErr",
+"METAL_P-value",
+"METAL_Freq1"
+}
+
+if not required.issubset(reader.fieldnames or []):
+raise ValueError("Missing MGBB columns: " + str(path))
+
+for row in reader:
+parts = row["Normalized_ID"].split(":")
+if len(parts) != 4:
+raise ValueError(
+"Unexpected SNP ID: " + row["Normalized_ID"]
+)
+
+key = variant_key(*parts)
+p = number(row["METAL_P-value"])
+
+if p is None or not 0 <= p < float(threshold):
+raise ValueError(
+"Invalid or out-of-threshold MGBB P-value: "
++ str(path)
+)
+
+record = {
+name: value
+for name, value in row.items()
+if name.startswith("METAL_")
+or name == "Normalized_ID"
+}
+
+if key in records and records[key] != record:
+raise ValueError(
+"Conflicting MGBB duplicate: " + str(key)
+)
+
+records[key] = record
+
+return records
+
+
+def read_fhs(path, wanted):
+matches = {}
+
+with path.open() as handle:
+header = handle.readline().split()
+required = {
+"CHROM", "GENPOS", "ID",
+"ALLELE0", "ALLELE1", "A1FREQ",
+"TEST", "BETA", "SE", "LOG10P"
+}
+
+if not required.issubset(header):
+raise ValueError("Missing FHS columns: " + str(path))
+
+for line_number, line in enumerate(handle, 2):
+if not line.strip():
+continue
+
+fields = line.split()
+if len(fields) != len(header):
+raise ValueError(
+"Malformed row {} in {}".format(
+line_number, path
+)
+)
+
+row = dict(zip(header, fields))
+if row["TEST"] != "ADD":
+continue
+
+key = variant_key(
+row["CHROM"],
+row["GENPOS"],
+row["ALLELE0"],
+row["ALLELE1"]
+)
+
+if key not in wanted:
+continue
+
+if key in matches and matches[key] != row:
+raise ValueError(
+"Conflicting FHS duplicate: " + str(key)
+)
+
+matches[key] = row
+
+return matches
+
+
+def align(m, f):
+a1 = m["METAL_Allele1"].upper()
+a2 = m["METAL_Allele2"].upper()
+f0 = f["ALLELE0"].upper()
+f1 = f["ALLELE1"].upper()
+
+mbeta = number(m["METAL_Effect"])
+fbeta = number(f["BETA"])
+ffreq = number(f["A1FREQ"])
+
+if ffreq is not None and not 0 <= ffreq <= 1:
+ffreq = None
+
+if a1 == a2 or f0 == f1:
+return "NA", "NA", "NA", "invalid_allele_pair"
+
+if a1 == f1 and a2 == f0:
+aligned_beta = fbeta
+aligned_freq = ffreq
+status = "no_flip"
+elif a1 == f0 and a2 == f1:
+aligned_beta = -fbeta if fbeta is not None else None
+aligned_freq = 1.0 - ffreq if ffreq is not None else None
+status = "beta_sign_flipped"
+else:
+return "NA", "NA", "NA", "allele_mismatch"
+
+# Preserve the previous conservative treatment of palindromic SNPs.
+if {a1, a2} in ({"A", "T"}, {"C", "G"}):
+return "NA", "NA", "NA", "palindromic_ambiguous"
+
+if mbeta is None or aligned_beta is None:
+agreement = "NA"
+status = "missing_beta"
+elif mbeta == 0 or aligned_beta == 0:
+agreement = "NA"
+status = "zero_beta"
+else:
+agreement = (
+"TRUE"
+if (mbeta > 0) == (aligned_beta > 0)
+else "FALSE"
+)
+
+return (
+aligned_beta if aligned_beta is not None else "NA",
+aligned_freq if aligned_freq is not None else "NA",
+agreement,
+status
+)
+
+
+def write_table(path, rows, columns, delimiter):
+with path.open("w", newline="") as handle:
+writer = csv.DictWriter(
+handle,
+fieldnames=columns,
+delimiter=delimiter
+)
+writer.writeheader()
+writer.writerows(rows)
+
+
+# Discover all features from corrected MGBB files.
+groups = {}
+
+for path in sorted(MGBB.glob("*_FHS_lookup.tsv")):
+match = re.fullmatch(
+r"(.+)_p(5e-[78])_FHS_lookup.tsv",
+path.name
+)
+if match:
+feature, threshold = match.groups()
+groups.setdefault(feature, {})[threshold] = path
+
+if not groups:
+raise SystemExit(
+"No corrected MGBB files found. Run the correction first: "
++ str(MGBB)
+)
+
+if OUT.exists():
+raise SystemExit(
+"Output directory already exists. Change OUT to a new folder: "
++ str(OUT)
+)
+
+# Validate all feature/threshold inputs before processing FHS.
+inputs = {}
+
+for feature, paths in sorted(groups.items()):
+for threshold in THRESHOLDS:
+if threshold not in paths:
+raise SystemExit(
+"Missing MGBB lookup: {} {}".format(
+feature, threshold
+)
+)
+
+fhs_path = FHS / ("FHS_" + feature + "_merged.regenie")
+if not fhs_path.is_file():
+raise SystemExit(
+"Missing merged FHS file: " + str(fhs_path)
+)
+
+inputs[feature] = {
+threshold: read_mgbb(paths[threshold], threshold)
+for threshold in THRESHOLDS
+}
+
+if not set(inputs[feature]["5e-8"]).issubset(
+inputs[feature]["5e-7"]
+):
+raise SystemExit(
+"MGBB threshold sets are inconsistent: " + feature
+)
+
+
+all_rows = []
+summary_rows = []
+
+for feature, sets in sorted(inputs.items()):
+fhs_records = read_fhs(
+FHS / ("FHS_" + feature + "_merged.regenie"),
+set(sets["5e-7"])
+)
+
+for threshold in THRESHOLDS:
+mgbb_records = sets[threshold]
+feature_rows = []
+
+for key, m in mgbb_records.items():
+f = fhs_records.get(key)
+if f is None:
+continue
+
+aligned_beta, aligned_freq, agreement, status = align(m, f)
+
+logp = number(f["LOG10P"])
+significant = "NA"
+
+if logp is not None and logp >= 0:
+significant = (
+"TRUE" if logp > SIGNIFICANCE_CUTOFF else "FALSE"
+)
+
+both = "NA"
+if agreement in ("TRUE", "FALSE") and significant != "NA":
+both = (
+"TRUE"
+if agreement == "TRUE" and significant == "TRUE"
+else "FALSE"
+)
+
+mfreq = number(m["METAL_Freq1"])
+frequency_gap = "NA"
+
+if (
+mfreq is not None
+and 0 <= mfreq <= 1
+and aligned_freq != "NA"
+):
+frequency_gap = round(
+abs(mfreq - aligned_freq), 6
+)
+
+feature_rows.append({
+"Feature": feature,
+"CHROM": key[0],
+"POS": key[1],
+"MGBB_SNP_ID": m["Normalized_ID"],
+"FHS_SNP_ID": f["ID"],
+"MGBB_P_value": m["METAL_P-value"],
+"MGBB_BETA": m["METAL_Effect"],
+"MGBB_SE": m["METAL_StdErr"],
+"MGBB_effect_allele_frequency": m["METAL_Freq1"],
+"FHS_P_value": fhs_pvalue(f["LOG10P"]),
+"FHS_BETA_aligned_to_MGBB": aligned_beta,
+"FHS_SE": f["SE"],
+"Same_direction_and_FHS_P_lt_0.05": both,
+"Directional_agreement": agreement
+})
+
+overlap = len(feature_rows)
+same = sum(
+r["Directional_agreement"] == "TRUE"
+for r in feature_rows
+)
+opposite = sum(
+r["Directional_agreement"] == "FALSE"
+for r in feature_rows
+)
+evaluable = same + opposite
+significant = sum(
+r["FHS_P_lt_0.05"] == "TRUE"
+for r in feature_rows
+)
+both = sum(
+r["Same_direction_and_FHS_P_lt_0.05"] == "TRUE"
+for r in feature_rows
+)
+
+summary_rows.append({
+"Feature": feature,
+"MGBB_P_threshold": "<" + threshold,
+"MGBB_unique_SNPs": len(mgbb_records),
+"Overlapping_SNPs": overlap,
+"Not_found_SNPs": len(mgbb_records) - overlap,
+"Overlap_pct_of_MGBB": percentage(
+overlap, len(mgbb_records)
+),
+"Direction_evaluable_SNPs": evaluable,
+"Same_direction_SNPs": same,
+"Agreement_pct_of_evaluable": percentage(same, evaluable),
+"FHS_P_lt_0.05_SNPs": significant,
+),
+"Invalid_FHS_LOG10P_SNPs": sum(
+r["FHS_P_lt_0.05"] == "NA"
+for r in feature_rows
+)
+})
+
+for row in feature_rows:
+row["Feature_overlap_N"] = overlap
+row["Feature_direction_evaluable_N"] = evaluable
+row["Feature_agreement_pct_of_overlap"] = percentage(
+same, overlap
+)
+row["Feature_agreement_pct_of_evaluable"] = percentage(
+same, evaluable
+)
+
+all_rows.extend(feature_rows)
+
+print(
+"{} {}: overlap={}, same={}, opposite={}, "
+"unresolved={}, P<0.05={}, both={}".format(
+feature, threshold, overlap, same, opposite,
+overlap - evaluable, significant, both
+),
+flush=True
+)
+
+
+columns = [
+"Feature",
+"MGBB_P_threshold",
+"CHROM",
+"POS",
+"MGBB_SNP_ID",
+"FHS_SNP_ID",
+"MGBB_P_value",
+"MGBB_BETA",
+"MGBB_SE",
+"FHS_P_value",
+"FHS_LOG10P",
+"FHS_BETA_aligned_to_MGBB",
+"FHS_SE",
+"Feature_agreement_pct_of_overlap",
+"Directional_agreement"
+]
+
+OUT.mkdir(parents=True)
+
+write_table(
+OUT / "all_features_overlap.csv",
+all_rows, columns, ","
+)
+write_table(
+OUT / "all_features_overlap.tsv",
+all_rows, columns, "\t"
+)
+write_table(
+OUT / "feature_summary.tsv",
+summary_rows, list(summary_rows[0]), "\t"
+)
+
+print("\nCompleted: {} features, {} summary rows, {} SNP rows.".format(
+len(inputs), len(summary_rows), len(all_rows)
+))
+print("Combined table: " + str(OUT / "all_features_overlap.csv"))
+print("TSV copy: " + str(OUT / "all_features_overlap.tsv"))
+print("Feature summary: " + str(OUT / "feature_summary.tsv"))
+PY
+
